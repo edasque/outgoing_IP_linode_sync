@@ -2,6 +2,7 @@ const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
 const cron = require('node-cron');
 const path = require('path');
+const fs = require('fs');
 
 class IPMonitor {
   constructor(config) {
@@ -23,6 +24,10 @@ class IPMonitor {
     };
     
     this.db = null;
+    this.dbRetryAttempts = 0;
+    this.maxRetryAttempts = 3;
+    this.retryDelay = 1000; // Start with 1 second
+    this.dbConnectionHealthy = false;
     this.init();
   }
 
@@ -36,31 +41,99 @@ class IPMonitor {
     }
   }
 
-  initDatabase() {
-    return new Promise((resolve, reject) => {
-      this.db = new sqlite3.Database(this.config.database.path, (err) => {
-        if (err) {
-          reject(err);
-          return;
+  // Database utility methods
+  async validateDatabasePath() {
+    const dbPath = this.config.database.path;
+    const dbDir = path.dirname(dbPath);
+    
+    try {
+      // Check if directory exists, create if not
+      if (!fs.existsSync(dbDir)) {
+        console.log(`Creating database directory: ${dbDir}`);
+        fs.mkdirSync(dbDir, { recursive: true });
+      }
+      
+      // Check directory permissions
+      fs.accessSync(dbDir, fs.constants.W_OK);
+      
+      // Check available disk space (basic check)
+      const stats = fs.statSync(dbDir);
+      if (stats.size !== undefined && stats.size < 1024 * 1024) { // Less than 1MB
+        console.warn('Low disk space detected for database directory');
+      }
+      
+      return true;
+    } catch (error) {
+      throw new Error(`Database path validation failed: ${error.message}`);
+    }
+  }
+
+  async sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  async retryOperation(operation, operationName = 'database operation') {
+    for (let attempt = 1; attempt <= this.maxRetryAttempts; attempt++) {
+      try {
+        const result = await operation();
+        if (attempt > 1) {
+          console.log(`${operationName} succeeded on attempt ${attempt}`);
+        }
+        return result;
+      } catch (error) {
+        if (attempt === this.maxRetryAttempts) {
+          console.error(`${operationName} failed after ${this.maxRetryAttempts} attempts:`, error.message);
+          throw error;
         }
         
-        // Create table if it doesn't exist
-        this.db.run(`
-          CREATE TABLE IF NOT EXISTS ip_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ip_address TEXT NOT NULL,
-            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-          )
-        `, (err) => {
-          if (err) {
-            reject(err);
-          } else {
-            console.log('Database initialized');
-            resolve();
-          }
+        const delay = this.retryDelay * Math.pow(2, attempt - 1); // Exponential backoff
+        console.warn(`${operationName} failed (attempt ${attempt}/${this.maxRetryAttempts}), retrying in ${delay}ms:`, error.message);
+        await this.sleep(delay);
+      }
+    }
+  }
+
+  async initDatabase() {
+    try {
+      // Validate database path first
+      await this.validateDatabasePath();
+      
+      // Initialize database with retry logic
+      await this.retryOperation(async () => {
+        return new Promise((resolve, reject) => {
+          this.db = new sqlite3.Database(this.config.database.path, (err) => {
+            if (err) {
+              this.dbConnectionHealthy = false;
+              reject(new Error(`Database connection failed: ${err.message}`));
+              return;
+            }
+            
+            // Create table if it doesn't exist
+            this.db.run(`
+              CREATE TABLE IF NOT EXISTS ip_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip_address TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+              )
+            `, (err) => {
+              if (err) {
+                this.dbConnectionHealthy = false;
+                reject(new Error(`Table creation failed: ${err.message}`));
+              } else {
+                this.dbConnectionHealthy = true;
+                console.log('Database initialized successfully');
+                resolve();
+              }
+            });
+          });
         });
-      });
-    });
+      }, 'Database initialization');
+      
+    } catch (error) {
+      this.dbConnectionHealthy = false;
+      console.error('Database initialization failed completely:', error.message);
+      throw error;
+    }
   }
 
   async getCurrentIP() {
@@ -80,37 +153,61 @@ class IPMonitor {
     }
   }
 
-  getLastStoredIP() {
-    return new Promise((resolve, reject) => {
-      this.db.get(`
-        SELECT ip_address, created_at
-        FROM ip_history
-        ORDER BY created_at DESC
-        LIMIT 1
-      `, (err, row) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(row || null);
-        }
-      });
-    });
+  async getLastStoredIP() {
+    if (!this.dbConnectionHealthy) {
+      console.warn('Database not healthy, returning null for last stored IP');
+      return null;
+    }
+    
+    try {
+      return await this.retryOperation(async () => {
+        return new Promise((resolve, reject) => {
+          this.db.get(`
+            SELECT ip_address, created_at
+            FROM ip_history
+            ORDER BY created_at DESC
+            LIMIT 1
+          `, (err, row) => {
+            if (err) {
+              reject(new Error(`Failed to get last stored IP: ${err.message}`));
+            } else {
+              resolve(row || null);
+            }
+          });
+        });
+      }, 'Get last stored IP');
+    } catch (error) {
+      console.error('Failed to get last stored IP after retries, continuing without history:', error.message);
+      return null; // Graceful degradation - continue without history
+    }
   }
 
-  insertIPRecord(ip) {
-    return new Promise((resolve, reject) => {
-      this.db.run(`
-        INSERT INTO ip_history (ip_address, created_at)
-        VALUES (?, CURRENT_TIMESTAMP)
-      `, [ip], function(err) {
-        if (err) {
-          reject(err);
-        } else {
-          console.log(`IP record inserted with ID: ${this.lastID}`);
-          resolve(this.lastID);
-        }
-      });
-    });
+  async insertIPRecord(ip) {
+    if (!this.dbConnectionHealthy) {
+      console.warn('Database not healthy, skipping IP record insertion');
+      return null;
+    }
+    
+    try {
+      return await this.retryOperation(async () => {
+        return new Promise((resolve, reject) => {
+          this.db.run(`
+            INSERT INTO ip_history (ip_address, created_at)
+            VALUES (?, CURRENT_TIMESTAMP)
+          `, [ip], function(err) {
+            if (err) {
+              reject(new Error(`Failed to insert IP record: ${err.message}`));
+            } else {
+              console.log(`IP record inserted with ID: ${this.lastID}`);
+              resolve(this.lastID);
+            }
+          });
+        });
+      }, 'Insert IP record');
+    } catch (error) {
+      console.error('Failed to insert IP record after retries, continuing without database logging:', error.message);
+      return null; // Graceful degradation - continue without database logging
+    }
   }
 
   async sendPushoverNotification(message, title = 'IP Monitor') {
@@ -207,25 +304,35 @@ class IPMonitor {
     try {
       console.log('\n--- Starting IP check ---');
       
+      // Perform database health check
+      await this.checkDatabaseHealth();
+      if (!this.dbConnectionHealthy) {
+        console.warn('Database health check failed, continuing with limited functionality');
+      }
+      
       // Get current IP
       const currentIP = await this.getCurrentIP();
       
-      // Get last stored IP
+      // Get last stored IP (gracefully handles DB failure)
       const lastRecord = await this.getLastStoredIP();
       const lastIP = lastRecord?.ip_address || 'no_previous_ip';
       
       console.log(`Current IP: ${currentIP}`);
-      console.log(`Last stored IP: ${lastIP}`);
+      console.log(`Last stored IP: ${lastIP} ${!this.dbConnectionHealthy ? '(database unavailable)' : ''}`);
       
       // Check if IP has changed
       if (currentIP !== lastIP) {
         console.log('🌐 IP address has changed!');
         
-        // Insert new IP record
-        await this.insertIPRecord(currentIP);
+        // Insert new IP record (gracefully handles DB failure)
+        const insertResult = await this.insertIPRecord(currentIP);
+        if (!insertResult && this.dbConnectionHealthy) {
+          console.warn('Failed to log IP change to database, but continuing...');
+        }
         
         // Send notification about change
-        const changeMessage = `🌐 IP Address Changed!\n\nNew IP: ${currentIP}\nPrevious IP: ${lastIP}\nTime: ${new Date().toISOString()}`;
+        const dbStatus = this.dbConnectionHealthy ? '' : ' (Database logging unavailable)';
+        const changeMessage = `🌐 IP Address Changed!\n\nNew IP: ${currentIP}\nPrevious IP: ${lastIP}\nTime: ${new Date().toISOString()}${dbStatus}`;
         await this.sendPushoverNotification(changeMessage);
         
         // Update DNS records if Linode is configured
@@ -247,7 +354,10 @@ class IPMonitor {
         }
       } else {
         console.log('IP address has not changed');
-        await this.sendPushoverNotification('The IP address has stayed the same on Naples');
+        const statusMessage = this.dbConnectionHealthy ? 
+          'The IP address has stayed the same on Naples' : 
+          'The IP address has stayed the same on Naples (Database logging unavailable)';
+        await this.sendPushoverNotification(statusMessage);
       }
       
       console.log('--- IP check completed ---\n');
@@ -295,21 +405,59 @@ class IPMonitor {
   }
 
   // Get IP history
-  getIPHistory(limit = 10) {
-    return new Promise((resolve, reject) => {
-      this.db.all(`
-        SELECT ip_address, created_at
-        FROM ip_history
-        ORDER BY created_at DESC
-        LIMIT ?
-      `, [limit], (err, rows) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(rows);
-        }
+  async getIPHistory(limit = 10) {
+    if (!this.dbConnectionHealthy) {
+      console.warn('Database not healthy, returning empty history');
+      return [];
+    }
+    
+    try {
+      return await this.retryOperation(async () => {
+        return new Promise((resolve, reject) => {
+          this.db.all(`
+            SELECT ip_address, created_at
+            FROM ip_history
+            ORDER BY created_at DESC
+            LIMIT ?
+          `, [limit], (err, rows) => {
+            if (err) {
+              reject(new Error(`Failed to get IP history: ${err.message}`));
+            } else {
+              resolve(rows || []);
+            }
+          });
+        });
+      }, 'Get IP history');
+    } catch (error) {
+      console.error('Failed to get IP history after retries:', error.message);
+      return []; // Graceful degradation - return empty array
+    }
+  }
+  
+  // Database health check
+  async checkDatabaseHealth() {
+    if (!this.db) {
+      this.dbConnectionHealthy = false;
+      return false;
+    }
+    
+    try {
+      await new Promise((resolve, reject) => {
+        this.db.get('SELECT 1', (err, row) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve(row);
+          }
+        });
       });
-    });
+      this.dbConnectionHealthy = true;
+      return true;
+    } catch (error) {
+      console.warn('Database health check failed:', error.message);
+      this.dbConnectionHealthy = false;
+      return false;
+    }
   }
 }
 
